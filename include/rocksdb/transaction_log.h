@@ -112,7 +112,13 @@ class TransactionLogIterator {
     // Default: true
     bool verify_checksums_;
 
-    ReadOptions() : verify_checksums_(true) {}
+    // if true, the mapping of db sequence to WAL file block index will be
+    // cached. This prevents the need to read from the beginning of the target
+    // wal log when GetUpdatesSince() is called.
+    // Default: true
+    bool with_cache_;
+
+    ReadOptions() : verify_checksums_(true), with_cache_(true) {}
 
     explicit ReadOptions(bool verify_checksums)
         : verify_checksums_(verify_checksums) {}

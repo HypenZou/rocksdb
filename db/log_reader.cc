@@ -38,7 +38,8 @@ Reader::Reader(std::shared_ptr<Logger> info_log,
       last_record_offset_(0),
       end_of_buffer_offset_(0),
       log_number_(log_num),
-      recycled_(false) {}
+      recycled_(false),
+      skipped_(false) {}
 
 Reader::~Reader() {
   delete[] backing_store_;
@@ -79,6 +80,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
         scratch->clear();
         *record = fragment;
         last_record_offset_ = prospective_record_offset;
+        skipped_ = false;
         return true;
 
       case kFirstType:
@@ -93,13 +95,16 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
         prospective_record_offset = physical_record_offset;
         scratch->assign(fragment.data(), fragment.size());
         in_fragmented_record = true;
+        skipped_ = false;
         break;
 
       case kMiddleType:
       case kRecyclableMiddleType:
         if (!in_fragmented_record) {
-          ReportCorruption(fragment.size(),
-                           "missing start of fragmented record(1)");
+          if (!skipped_) {
+            ReportCorruption(fragment.size(),
+                             "missing start of fragmented record(1)");
+          }
         } else {
           scratch->append(fragment.data(), fragment.size());
         }
@@ -108,8 +113,10 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kLastType:
       case kRecyclableLastType:
         if (!in_fragmented_record) {
-          ReportCorruption(fragment.size(),
-                           "missing start of fragmented record(2)");
+          if (!skipped_) {
+            ReportCorruption(fragment.size(),
+                             "missing start of fragmented record(2)");
+          }
         } else {
           scratch->append(fragment.data(), fragment.size());
           *record = Slice(*scratch);

@@ -13,6 +13,7 @@
 
 #include "db/log_format.h"
 #include "file/sequence_file_reader.h"
+#include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -101,6 +102,21 @@ class Reader {
     return static_cast<size_t>(end_of_buffer_offset_);
   }
 
+
+  rocksdb::IOStatus Skip(uint64_t n) {
+    if (n == 0) {
+      return IOStatus::OK();
+    }
+    auto s = file_->Skip(n);
+    if (!s.ok()) {
+      return s;
+    }
+    end_of_buffer_offset_ += n;
+    skipped_ = true;
+    buffer_.clear();
+    return s;
+  }
+
  protected:
   std::shared_ptr<Logger> info_log_;
   const std::unique_ptr<SequentialFileReader> file_;
@@ -127,6 +143,9 @@ class Reader {
 
   // Whether this is a recycled log file
   bool recycled_;
+
+  // if log reader is skipped, may need to drop bytes until seek to first of a record
+  bool skipped_;
 
   // Extend record types with the following special values
   enum {

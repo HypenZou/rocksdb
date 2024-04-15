@@ -17,6 +17,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -57,6 +58,59 @@ class LogFileImpl : public LogFile {
 
 };
 
+class TransactionLogSeqCache {
+ public:
+  TransactionLogSeqCache(size_t size)
+      : size_(size), rand_(std::random_device{}()) {}
+  struct SeqWithFileBlockIdx {
+    uint64_t log_number;
+    uint64_t seq_number;
+    uint64_t block_index;
+    SeqWithFileBlockIdx(uint64_t log_num, uint64_t seq_num, uint64_t block_idx)
+        : log_number(log_num), seq_number(seq_num), block_index(block_idx){};
+    bool operator<(const SeqWithFileBlockIdx& other) const {
+      return std::tie(other.log_number, other.seq_number, other.block_index) <
+             std::tie(log_number, seq_number, block_index);
+    }
+    bool operator==(const SeqWithFileBlockIdx& other) const {
+      return std::tie(log_number, seq_number, block_index) ==
+             std::tie(other.log_number, other.seq_number, other.block_index);
+    }
+  };
+
+  void Insert(uint64_t log_number, uint64_t seq_number, uint64_t block_index) {
+    std::lock_guard<std::mutex> lk{mutex_};
+    if (cache_.size() > size_) {
+      auto iter = cache_.begin();
+      std::advance(iter, rand_.Next() % cache_.size());
+      cache_.erase(iter);
+    }
+    cache_.emplace(log_number, seq_number, block_index);
+  }
+
+  bool Lookup(uint64_t log_number, uint64_t seq_number, uint64_t* block_index) {
+    std::lock_guard<std::mutex> lk{mutex_};
+    const static uint64_t max_block_index =
+        std::numeric_limits<uint64_t>::max();
+    auto iter = cache_.lower_bound(
+        SeqWithFileBlockIdx{log_number, seq_number, max_block_index});
+    if (iter == cache_.end()) {
+      return false;
+    }
+    if (log_number == iter->log_number && seq_number >= iter->seq_number) {
+      *block_index = iter->block_index;
+      return true;
+    }
+    return false;
+  }
+
+ private:
+  size_t size_;
+  std::mutex mutex_;
+  Random32 rand_;
+  std::set<SeqWithFileBlockIdx> cache_;
+};
+
 class TransactionLogIteratorImpl : public TransactionLogIterator {
  public:
   TransactionLogIteratorImpl(
@@ -64,7 +118,8 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
       const TransactionLogIterator::ReadOptions& read_options,
       const EnvOptions& soptions, const SequenceNumber seqNum,
       std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions,
-      const bool seq_per_batch, const std::shared_ptr<IOTracer>& io_tracer);
+      const bool seq_per_batch, const std::shared_ptr<IOTracer>& io_tracer,
+      const std::shared_ptr<TransactionLogSeqCache>& transaction_log_seq_cache);
 
   virtual bool Valid() override;
 
@@ -88,6 +143,7 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   std::unique_ptr<WriteBatch> current_batch_;
   std::unique_ptr<log::Reader> current_log_reader_;
   std::string scratch_;
+  std::shared_ptr<TransactionLogSeqCache> transaction_log_seq_cache_;
   Status OpenLogFile(const LogFile* log_file,
                      std::unique_ptr<SequentialFileReader>* file);
 
@@ -122,8 +178,8 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   bool IsBatchExpected(const WriteBatch* batch, SequenceNumber expected_seq);
   // Update current batch if a continuous batch is found, else return false
   void UpdateCurrentWriteBatch(const Slice& record);
-  Status OpenLogReader(const LogFile* file);
   std::shared_ptr<IOTracer> io_tracer_;
+  Status OpenLogReader(const LogFile* file, uint64_t hint_offset);
 };
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE
