@@ -72,14 +72,23 @@ class TransactionLogSeqCache {
           block_index(block_idx),
           timestamp(ts){};
     bool operator<(const SeqWithFileBlockIdx& other) const {
-      return std::tie(other.log_number, other.seq_number, other.block_index,
-                      other.timestamp) <
-             std::tie(log_number, seq_number, block_index, other.timestamp);
+      return std::tie(other.log_number, other.seq_number) <
+             std::tie(log_number, seq_number);
     }
   };
 
   void Insert(uint64_t log_number, uint64_t seq_number, uint64_t block_index) {
     std::lock_guard<std::mutex> lk{mutex_};
+    auto now = clock_->NowMicros();
+    auto res = cache_.emplace(log_number, seq_number, block_index, now);
+    if (!res.second) {
+      // block idx should be the same with the same log number and seq number
+      assert(block_index == res.first->block_index);
+      auto pos_hint = res.first;
+      pos_hint++;
+      cache_.erase(res.first);
+      cache_.emplace_hint(pos_hint, log_number, seq_number, block_index, now);
+    }
     // delete the oldest record when cache is full
     if (cache_.size() > size_) {
       auto iter = std::min_element(cache_.begin(), cache_.end(),
@@ -88,7 +97,6 @@ class TransactionLogSeqCache {
                                    });
       cache_.erase(iter);
     }
-    cache_.emplace(log_number, seq_number, block_index, clock_->NowMicros());
   }
 
   bool Lookup(uint64_t log_number, uint64_t seq_number, uint64_t* block_index) {
