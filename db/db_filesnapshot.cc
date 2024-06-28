@@ -30,7 +30,6 @@
 namespace ROCKSDB_NAMESPACE {
 
 Status DBImpl::FlushForGetLiveFiles() {
-  TEST_SYNC_POINT("DBImpl::FlushForGetLiveFiles");
   return DBImpl::FlushAllColumnFamilies(FlushOptions(),
                                         FlushReason::kGetLiveFiles);
 }

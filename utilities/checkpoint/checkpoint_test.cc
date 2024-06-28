@@ -9,6 +9,8 @@
 
 // Syncpoint prevents us building and running tests in release
 #include "rocksdb/utilities/checkpoint.h"
+#include <gtest/gtest.h>
+#include <cstdlib>
 
 #ifndef OS_WIN
 #include <unistd.h>
@@ -254,6 +256,13 @@ class CheckpointTest : public testing::Test {
       result = s.ToString();
     }
     return result;
+  }
+
+  int NumTableFilesAtLevel(int level) {
+    std::string property;
+    EXPECT_TRUE(db_->GetProperty(
+        "rocksdb.num-files-at-level" + std::to_string(level), &property));
+    return atoi(property.c_str());
   }
 };
 
@@ -992,11 +1001,10 @@ TEST_F(CheckpointTest, CheckpointWithArchievedLog) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
       {{"WalManager::ArchiveWALFile",
         "CheckpointTest:CheckpointWithArchievedLog"}});
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::FlushForGetLiveFiles", [&](void*) { flushed = true; });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.WAL_ttl_seconds = 3600;
+  options.disable_auto_compactions = true;
   DestroyAndReopen(options);
 
   ASSERT_OK(Put("key1", std::string(1024 * 1024, 'a')));
@@ -1007,10 +1015,10 @@ TEST_F(CheckpointTest, CheckpointWithArchievedLog) {
   Checkpoint* checkpoint;
   ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
   TEST_SYNC_POINT("CheckpointTest:CheckpointWithArchievedLog");
-  // unflushed log size < 1024 * 1024 < total file size including archived log,
-  // flush shouldn't occur
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, 1024 * 1024));
-  ASSERT_TRUE(!flushed);
+  // unflushed log size < 1024 * 1024 < total file size including archived log,
+  // so flush shouldn't occur, only one file at level 0
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
   delete checkpoint;
   checkpoint = nullptr;
 
