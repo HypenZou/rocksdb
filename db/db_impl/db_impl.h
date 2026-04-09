@@ -2653,6 +2653,40 @@ class DBImpl : public DB {
                          bool* flush_rescheduled_to_retain_udt,
                          Env::Priority thread_pri);
 
+  struct PeriodicCompactionCheckerWork {
+    PeriodicCompactionCheckerWork() = default;
+    ~PeriodicCompactionCheckerWork() = default;
+
+    PeriodicCompactionCheckerWork(const PeriodicCompactionCheckerWork&) =
+        delete;
+    PeriodicCompactionCheckerWork& operator=(
+        const PeriodicCompactionCheckerWork&) = delete;
+    PeriodicCompactionCheckerWork(PeriodicCompactionCheckerWork&&) = delete;
+    PeriodicCompactionCheckerWork& operator=(PeriodicCompactionCheckerWork&&) =
+        delete;
+
+    void Reset();
+
+    ColumnFamilyData* cfd = nullptr;
+    Version* version = nullptr;
+    FileMetaData* file = nullptr;
+    std::shared_ptr<PeriodicCompactionCheckerFactory> factory;
+    uint64_t file_number = 0;
+    uint64_t current_time = 0;
+    uint64_t file_age = 0;
+    uint64_t periodic_compaction_seconds = 0;
+    uint32_t column_family_id = 0;
+    int level = -1;
+    bool is_bottommost_level = false;
+  };
+
+  bool MaybePreparePeriodicCompactionCheckerWork(
+      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+      PeriodicCompactionCheckerWork* work, LogBuffer* log_buffer);
+  bool RunPeriodicCompactionChecker(
+      const ReadOptions& read_options, PeriodicCompactionCheckerWork* work,
+      LogBuffer* log_buffer);
+
   Compaction* CreateIntendedCompactionForwardedToBottomPriorityPool(
       Compaction* c);
   bool EnoughRoomForCompaction(ColumnFamilyData* cfd,

@@ -27,6 +27,9 @@ bool LevelCompactionPicker::NeedsCompaction(
   if (!vstorage->FilesMarkedForPeriodicCompaction().empty()) {
     return true;
   }
+  if (!vstorage->FilesPendingPeriodicCompactionCheck().empty()) {
+    return true;
+  }
   if (!vstorage->BottommostFilesMarkedForCompaction().empty()) {
     return true;
   }

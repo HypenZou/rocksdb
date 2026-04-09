@@ -119,6 +119,17 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
 void DoGenerateLevelFilesBrief(LevelFilesBrief* file_level,
                                const std::vector<FileMetaData*>& files,
                                Arena* arena);
+
+// Resolves the timestamp used by periodic compaction checks in the following
+// order:
+// 1. `file_creation_time` table property.
+// 2. `oldest_ancester_time` table property.
+// 3. Filesystem mtime.
+// Returns false if the timestamp cannot be determined.
+bool TryGetPeriodicCompactionFileModificationTime(
+    const ImmutableOptions& ioptions, FileMetaData* file_meta,
+    uint64_t* file_modification_time);
+
 enum EpochNumberRequirement {
   kMightMissing,
   kMustPresent,
@@ -220,7 +231,10 @@ class VersionStorageInfo {
   // ComputeCompactionScore()
   void ComputeFilesMarkedForPeriodicCompaction(
       const ImmutableOptions& ioptions,
-      const uint64_t periodic_compaction_seconds, int last_level);
+      uint64_t periodic_compaction_seconds,
+      const std::shared_ptr<PeriodicCompactionCheckerFactory>&
+          periodic_compaction_checker_factory,
+      int last_level);
 
   // This computes bottommost_files_marked_for_compaction_ and is called by
   // ComputeCompactionScore() or UpdateOldestSnapshot().
@@ -517,6 +531,12 @@ class VersionStorageInfo {
     return files_marked_for_periodic_compaction_;
   }
 
+  const autovector<std::pair<int, FileMetaData*>>&
+  FilesPendingPeriodicCompactionCheck() const {
+    assert(finalized_);
+    return files_pending_periodic_compaction_check_;
+  }
+
   void TEST_AddFileMarkedForPeriodicCompaction(int level, FileMetaData* f) {
     files_marked_for_periodic_compaction_.emplace_back(level, f);
   }
@@ -751,6 +771,8 @@ class VersionStorageInfo {
 
   autovector<std::pair<int, FileMetaData*>>
       files_marked_for_periodic_compaction_;
+  autovector<std::pair<int, FileMetaData*>>
+      files_pending_periodic_compaction_check_;
 
   // These files are considered bottommost because none of their keys can exist
   // at lower levels. They are not necessarily all in the same level. The marked

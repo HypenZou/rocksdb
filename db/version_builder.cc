@@ -969,6 +969,18 @@ class VersionBuilder::Rep {
     FileMetaData* const f = new FileMetaData(meta);
     f->refs = 1;
 
+    const FileMetaData* const base_file =
+        base_vstorage_->GetFileMetaDataByNumber(file_number);
+    if (base_file != nullptr) {
+      // The same physical SST can be deleted and re-added to another level
+      // (e.g. trivial move). Preserve periodic checker runtime state across
+      // the new FileMetaData materialization so rejected/passed/in-flight
+      // checks are not forgotten.
+      f->periodic_checker_passed = base_file->periodic_checker_passed;
+      f->periodic_checker_in_progress = base_file->periodic_checker_in_progress;
+      f->last_periodic_checker_time = base_file->last_periodic_checker_time;
+    }
+
     if (file_metadata_cache_res_mgr_) {
       Status s = file_metadata_cache_res_mgr_->UpdateCacheReservation(
           f->ApproximateMemoryUsage(), true /* increase */);

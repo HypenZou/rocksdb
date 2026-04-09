@@ -20,6 +20,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class SliceTransform;
+class PeriodicCompactionCheckerFactory;
 class TablePropertiesCollectorFactory;
 class TableFactory;
 struct Options;
@@ -933,6 +934,10 @@ struct AdvancedColumnFamilyOptions {
   // 0: Turn off Periodic compactions.
   // UINT64_MAX - 1 (0xfffffffffffffffe) is special flag to allow RocksDB to
   // pick default.
+  //
+  // When `periodic_compaction_checker_factory` is configured, this option also
+  // controls how often a live file that was rejected by the checker can be
+  // re-checked.
   //
   // Default: 30 days if using block based table format + compaction filter +
   //  leveled compaction or block based table format + universal compaction.

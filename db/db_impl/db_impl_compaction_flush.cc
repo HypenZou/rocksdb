@@ -26,6 +26,7 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
+#include "rocksdb/periodic_compaction_checker.h"
 #include "rocksdb/table.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
@@ -34,6 +35,49 @@
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+bool TryGetPeriodicCompactionFileAge(const ImmutableOptions& ioptions,
+                                     FileMetaData* file_meta,
+                                     uint64_t current_time,
+                                     uint64_t* file_age) {
+  uint64_t file_modification_time = 0;
+  if (!TryGetPeriodicCompactionFileModificationTime(
+          ioptions, file_meta, &file_modification_time)) {
+    return false;
+  }
+
+  if (file_modification_time == 0 || file_modification_time > current_time) {
+    *file_age = 0;
+  } else {
+    *file_age = current_time - file_modification_time;
+  }
+  return true;
+}
+
+}  // namespace
+
+// REQUIRES: mutex_ is held
+void DBImpl::PeriodicCompactionCheckerWork::Reset() {
+  if (version != nullptr) {
+    version->Unref();
+    version = nullptr;
+  }
+  if (cfd != nullptr) {
+    cfd->UnrefAndTryDelete();
+    cfd = nullptr;
+  }
+  file = nullptr;
+  factory.reset();
+  file_number = 0;
+  current_time = 0;
+  file_age = 0;
+  periodic_compaction_seconds = 0;
+  column_family_id = 0;
+  level = -1;
+  is_bottommost_level = false;
+}
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -84,6 +128,157 @@ bool DBImpl::RequestCompactionToken(ColumnFamilyData* cfd, bool force,
     return true;
   }
   return false;
+}
+
+bool DBImpl::MaybePreparePeriodicCompactionCheckerWork(
+    ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+    PeriodicCompactionCheckerWork* work, LogBuffer* /*log_buffer*/) {
+  mutex_.AssertHeld();
+  assert(work != nullptr);
+  work->Reset();
+
+  if (mutable_cf_options.periodic_compaction_seconds == 0) {
+    return false;
+  }
+
+  const auto& factory = cfd->ioptions().periodic_compaction_checker_factory;
+  if (factory == nullptr) {
+    return false;
+  }
+
+  int64_t temp_current_time = 0;
+  auto status = cfd->ioptions().clock->GetCurrentTime(&temp_current_time);
+  if (!status.ok()) {
+    return false;
+  }
+
+  uint64_t current_time = static_cast<uint64_t>(temp_current_time);
+  Version* current = cfd->current();
+  VersionStorageInfo* vstorage = current->storage_info();
+  for (const auto& level_and_file :
+       vstorage->FilesPendingPeriodicCompactionCheck()) {
+    int level = level_and_file.first;
+    FileMetaData* file = level_and_file.second;
+    if (file->being_compacted || file->periodic_checker_in_progress ||
+        file->periodic_checker_passed) {
+      continue;
+    }
+
+    uint64_t file_age = 0;
+    if (!TryGetPeriodicCompactionFileAge(cfd->ioptions(), file, current_time,
+                                         &file_age)) {
+      continue;
+    }
+
+    file->periodic_checker_in_progress = true;
+    cfd->Ref();
+    current->Ref();
+
+    work->cfd = cfd;
+    work->version = current;
+    work->file = file;
+    work->factory = factory;
+    work->file_number = file->fd.GetNumber();
+    work->current_time = current_time;
+    work->file_age = file_age;
+    work->periodic_compaction_seconds =
+        mutable_cf_options.periodic_compaction_seconds;
+    work->column_family_id = cfd->GetID();
+    work->level = level;
+    work->is_bottommost_level =
+        level == vstorage->num_non_empty_levels() - 1;
+    return true;
+  }
+
+  return false;
+}
+
+bool DBImpl::RunPeriodicCompactionChecker(
+    const ReadOptions& read_options, PeriodicCompactionCheckerWork* work,
+    LogBuffer* log_buffer) {
+  mutex_.AssertHeld();
+  assert(work != nullptr);
+  if (work->cfd == nullptr) {
+    return false;
+  }
+
+  std::shared_ptr<const TableProperties> table_properties;
+  Status status;
+  bool should_compact = false;
+
+  // The checker runs against the captured Version/FileMetaData pair, not
+  // necessarily the latest live Version. `work` owns refs on both the CFD and
+  // Version, so `work->file` remains valid while the DB mutex is released even
+  // if another thread installs a newer SuperVersion concurrently.
+  mutex_.Unlock();
+  status = work->version->GetTableProperties(read_options, &table_properties,
+                                             work->file);
+  if (status.ok()) {
+    auto checker = work->factory->CreatePeriodicCompactionChecker();
+    if (checker != nullptr) {
+      PeriodicCompactionChecker::Context context;
+      context.column_family_id = work->column_family_id;
+      context.level = work->level;
+      context.is_bottommost_level = work->is_bottommost_level;
+      context.current_time = work->current_time;
+      context.periodic_compaction_seconds =
+          work->periodic_compaction_seconds;
+      context.file_age = work->file_age;
+      context.file_number = work->file_number;
+      should_compact = checker->ShouldCompact(context, *table_properties);
+    } else {
+      status = Status::Incomplete(
+          "PeriodicCompactionCheckerFactory returned nullptr");
+    }
+  }
+  mutex_.Lock();
+
+  if (!status.ok()) {
+    ROCKS_LOG_BUFFER(
+        log_buffer,
+        "[%s] Periodic compaction checker skipped file %" PRIu64 ": %s",
+        work->cfd->GetName().c_str(), work->file_number,
+        status.ToString().c_str());
+  }
+
+  const auto publish_result = [&](FileMetaData* target_file) {
+    if (target_file == nullptr) {
+      return false;
+    }
+    target_file->periodic_checker_in_progress = false;
+    if (target_file->being_compacted) {
+      return false;
+    }
+    target_file->periodic_checker_passed = status.ok() && should_compact;
+    target_file->last_periodic_checker_time = work->current_time;
+    return true;
+  };
+
+  // Publish to the captured FileMetaData as well as the current live one.
+  // During the unlocked callback window, another thread may start building a
+  // new Version from the captured Version. Updating only the current Version's
+  // FileMetaData can lose the checker timestamp when that in-flight Version is
+  // later installed.
+  publish_result(work->file);
+
+  if (!work->cfd->IsDropped()) {
+    // Publish the result only to the file that is still live in the current
+    // Version. The file examined above may already be obsolete by now, in
+    // which case the old in-progress flag is harmless because obsolete files
+    // are no longer considered for scheduling.
+    FileMetaData* live_file =
+        work->cfd->current()->storage_info()->GetFileMetaDataByNumber(
+            work->file_number);
+    if (publish_result(live_file)) {
+      work->cfd->current()->storage_info()->ComputeCompactionScore(
+          work->cfd->ioptions(), work->cfd->GetLatestMutableCFOptions(),
+          work->cfd->GetFullHistoryTsLow());
+    }
+  }
+
+  work->Reset();
+
+  return true;
 }
 
 bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
@@ -4135,82 +4330,98 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // throughout the compaction procedure to make sure consistency. It will
     // eventually be installed into SuperVersion
     const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
+    PeriodicCompactionCheckerWork periodic_checker_work;
+    bool periodic_checker_ran = false;
     if (!mutable_cf_options.disable_auto_compactions && !cfd->IsDropped()) {
-      // NOTE: try to avoid unnecessary copy of MutableCFOptions if
-      // compaction is not necessary. Need to make sure mutex is held
-      // until we make a copy in the following code
-      TEST_SYNC_POINT("DBImpl::BackgroundCompaction():BeforePickCompaction");
-      // This info is not useful for other scenarios, so save querying existing
-      // snapshots for those cases.
-      if (cfd->ioptions().compaction_style == kCompactionStyleUniversal &&
-          cfd->user_comparator()->timestamp_size() == 0) {
-        InitSnapshotContext(job_context);
-        assert(is_snapshot_supported_ || snapshots_.empty());
-      }
-      c.reset(cfd->PickCompaction(
-          mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
-          job_context->snapshot_checker, log_buffer,
-          thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
-      if (thread_pri == Env::Priority::LOW) {
-        TEST_SYNC_POINT("DBImpl::BackgroundCompaction():AfterPickCompaction");
-      } else if (thread_pri == Env::Priority::BOTTOM) {
-        TEST_SYNC_POINT_CALLBACK(
-            "DBImpl::BackgroundCompaction():AfterPickCompactionBottomPri",
-            c.get());
+      if (!need_repick) {
+        MaybePreparePeriodicCompactionCheckerWork(
+            cfd, mutable_cf_options, &periodic_checker_work, log_buffer);
+        periodic_checker_ran = RunPeriodicCompactionChecker(
+            read_options, &periodic_checker_work, log_buffer);
       }
 
-      if (c != nullptr) {
-        bool enough_room = EnoughRoomForCompaction(
-            cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer);
+      if (!cfd->IsDropped() && !mutable_cf_options.disable_auto_compactions) {
+        // NOTE: try to avoid unnecessary copy of MutableCFOptions if
+        // compaction is not necessary. Need to make sure mutex is held
+        // until we make a copy in the following code
+        TEST_SYNC_POINT("DBImpl::BackgroundCompaction():BeforePickCompaction");
+        // This info is not useful for other scenarios, so save querying
+        // existing snapshots for those cases.
+        if (cfd->ioptions().compaction_style == kCompactionStyleUniversal &&
+            cfd->user_comparator()->timestamp_size() == 0) {
+          InitSnapshotContext(job_context);
+          assert(is_snapshot_supported_ || snapshots_.empty());
+        }
+        c.reset(cfd->PickCompaction(
+            mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
+            job_context->snapshot_checker, log_buffer,
+            thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+        if (thread_pri == Env::Priority::LOW) {
+          TEST_SYNC_POINT("DBImpl::BackgroundCompaction():AfterPickCompaction");
+        } else if (thread_pri == Env::Priority::BOTTOM) {
+          TEST_SYNC_POINT_CALLBACK(
+              "DBImpl::BackgroundCompaction():AfterPickCompactionBottomPri",
+              c.get());
+        }
 
-        if (!enough_room) {
-          // Then don't do the compaction
-          c->ReleaseCompactionFiles(status);
-          c->column_family_data()
-              ->current()
-              ->storage_info()
-              ->ComputeCompactionScore(c->immutable_options(),
-                                       c->mutable_cf_options(),
-                                       cfd->GetFullHistoryTsLow());
-          EnqueuePendingCompaction(cfd);
+        if (c != nullptr) {
+          bool enough_room = EnoughRoomForCompaction(
+              cfd, *(c->inputs()), &sfm_reserved_compact_space, log_buffer);
 
-          c.reset();
-          // Don't need to sleep here, because BackgroundCallCompaction
-          // will sleep if !s.ok()
-          status = Status::CompactionTooLarge();
-        } else {
-          // update statistics
-          size_t num_files = 0;
-          for (auto& each_level : *c->inputs()) {
-            num_files += each_level.files.size();
+          if (!enough_room) {
+            // Then don't do the compaction
+            c->ReleaseCompactionFiles(status);
+            c->column_family_data()
+                ->current()
+                ->storage_info()
+                ->ComputeCompactionScore(c->immutable_options(),
+                                         c->mutable_cf_options(),
+                                         cfd->GetFullHistoryTsLow());
+            EnqueuePendingCompaction(cfd);
+
+            c.reset();
+            // Don't need to sleep here, because BackgroundCallCompaction
+            // will sleep if !s.ok()
+            status = Status::CompactionTooLarge();
+          } else {
+            // update statistics
+            size_t num_files = 0;
+            for (auto& each_level : *c->inputs()) {
+              num_files += each_level.files.size();
+            }
+            RecordInHistogram(stats_, NUM_FILES_IN_SINGLE_COMPACTION,
+                              num_files);
+
+            // There are three things that can change compaction score:
+            // 1) When flush or compaction finish. This case is covered by
+            // InstallSuperVersionAndScheduleWork
+            // 2) When MutableCFOptions changes. This case is also covered by
+            // InstallSuperVersionAndScheduleWork, because this is when the new
+            // options take effect.
+            // 3) When we Pick a new compaction, we "remove" those files being
+            // compacted from the calculation, which then influences compaction
+            // score. Inside EnqueuePendingCompaction(),  we check if we need
+            // the new compaction even without the files that are currently
+            // being compacted. If we need another compaction, we might be able
+            // to execute it in parallel, so we add it to the queue and
+            // schedule a new thread.
+            EnqueuePendingCompaction(cfd);
+            MaybeScheduleFlushOrCompaction();
           }
-          RecordInHistogram(stats_, NUM_FILES_IN_SINGLE_COMPACTION, num_files);
-
-          // There are three things that can change compaction score:
-          // 1) When flush or compaction finish. This case is covered by
-          // InstallSuperVersionAndScheduleWork
-          // 2) When MutableCFOptions changes. This case is also covered by
-          // InstallSuperVersionAndScheduleWork, because this is when the new
-          // options take effect.
-          // 3) When we Pick a new compaction, we "remove" those files being
-          // compacted from the calculation, which then influences compaction
-          // score. Inside EnqueuePendingCompaction(),  we check if we need
-          // the new compaction even without the files that are currently being
-          // compacted. If we need another compaction, we might be able to
-          // execute it in parallel, so we add it to the queue and schedule a
-          // new thread.
+        } else if (is_prepicked) {
+          ROCKS_LOG_BUFFER(
+              log_buffer,
+              "[%s] Pre-picked compaction repicked files for compaction as "
+              "required, "
+              "but upon re-evaluation, no compaction was found necessary \n",
+              cfd->GetName().c_str());
+        } else if (periodic_checker_ran) {
           EnqueuePendingCompaction(cfd);
           MaybeScheduleFlushOrCompaction();
         }
-      } else if (is_prepicked) {
-        ROCKS_LOG_BUFFER(
-            log_buffer,
-            "[%s] Pre-picked compaction repicked files for compaction as "
-            "required, "
-            "but upon re-evaluation, no compaction was found necessary \n",
-            cfd->GetName().c_str());
       }
     }
+
   }
 
   IOStatus io_s;

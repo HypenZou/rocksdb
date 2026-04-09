@@ -614,6 +614,9 @@ bool UniversalCompactionPicker::NeedsCompaction(
   if (!vstorage->FilesMarkedForPeriodicCompaction().empty()) {
     return true;
   }
+  if (!vstorage->FilesPendingPeriodicCompactionCheck().empty()) {
+    return true;
+  }
   if (!vstorage->FilesMarkedForCompaction().empty()) {
     return true;
   }

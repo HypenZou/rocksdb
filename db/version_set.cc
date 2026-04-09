@@ -3979,6 +3979,7 @@ void VersionStorageInfo::ComputeCompactionScore(
   ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
   ComputeFilesMarkedForPeriodicCompaction(
       immutable_options, mutable_cf_options.periodic_compaction_seconds,
+      immutable_options.periodic_compaction_checker_factory,
       max_output_level);
   ComputeFilesMarkedForForcedBlobGC(
       mutable_cf_options.blob_garbage_collection_age_cutoff,
@@ -4047,10 +4048,39 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
   }
 }
 
+bool TryGetPeriodicCompactionFileModificationTime(
+    const ImmutableOptions& ioptions, FileMetaData* file_meta,
+    uint64_t* file_modification_time) {
+  assert(file_meta != nullptr);
+  assert(file_modification_time != nullptr);
+
+  *file_modification_time = file_meta->TryGetFileCreationTime();
+  if (*file_modification_time == kUnknownFileCreationTime) {
+    *file_modification_time = file_meta->TryGetOldestAncesterTime();
+  }
+  if (*file_modification_time == kUnknownOldestAncesterTime) {
+    auto file_path = TableFileName(ioptions.cf_paths, file_meta->fd.GetNumber(),
+                                   file_meta->fd.GetPathId());
+    Status status =
+        ioptions.env->GetFileModificationTime(file_path, file_modification_time);
+    if (!status.ok()) {
+      ROCKS_LOG_WARN(ioptions.logger,
+                     "Can't get file modification time: %s: %s",
+                     file_path.c_str(), status.ToString().c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
 void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
     const ImmutableOptions& ioptions,
-    const uint64_t periodic_compaction_seconds, int last_level) {
+    uint64_t periodic_compaction_seconds,
+    const std::shared_ptr<PeriodicCompactionCheckerFactory>&
+        periodic_compaction_checker_factory,
+    int last_level) {
   files_marked_for_periodic_compaction_.clear();
+  files_pending_periodic_compaction_check_.clear();
   if (periodic_compaction_seconds == 0) {
     return;
   }
@@ -4080,35 +4110,33 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
       (offpeak_time_info.is_now_offpeak
            ? offpeak_time_info.seconds_till_next_offpeak_start
            : 0);
+  const bool use_periodic_checker =
+      periodic_compaction_checker_factory != nullptr;
 
   for (int level = 0; level <= last_level; level++) {
     for (auto f : files_[level]) {
       if (!f->being_compacted) {
-        // Compute a file's modification time in the following order:
-        // 1. Use file_creation_time table property if it is > 0.
-        // 2. Use creation_time table property if it is > 0.
-        // 3. Use file's mtime metadata if the above two table properties are 0.
-        // Don't consider the file at all if the modification time cannot be
-        // correctly determined based on the above conditions.
-        uint64_t file_modification_time = f->TryGetFileCreationTime();
-        if (file_modification_time == kUnknownFileCreationTime) {
-          file_modification_time = f->TryGetOldestAncesterTime();
-        }
-        if (file_modification_time == kUnknownOldestAncesterTime) {
-          auto file_path = TableFileName(ioptions.cf_paths, f->fd.GetNumber(),
-                                         f->fd.GetPathId());
-          status = ioptions.env->GetFileModificationTime(
-              file_path, &file_modification_time);
-          if (!status.ok()) {
-            ROCKS_LOG_WARN(ioptions.logger,
-                           "Can't get file modification time: %s: %s",
-                           file_path.c_str(), status.ToString().c_str());
-            continue;
-          }
+        uint64_t file_modification_time = 0;
+        if (!TryGetPeriodicCompactionFileModificationTime(
+                ioptions, f, &file_modification_time)) {
+          continue;
         }
         if (file_modification_time > 0 &&
             file_modification_time < adjusted_allowed_time_limit) {
-          files_marked_for_periodic_compaction_.emplace_back(level, f);
+          if (!use_periodic_checker) {
+            files_marked_for_periodic_compaction_.emplace_back(level, f);
+          } else if (f->periodic_checker_passed) {
+            files_marked_for_periodic_compaction_.emplace_back(level, f);
+          } else {
+            const bool should_rerun =
+                f->last_periodic_checker_time == 0 ||
+                (current_time >= f->last_periodic_checker_time &&
+                 current_time - f->last_periodic_checker_time >=
+                     periodic_compaction_seconds);
+            if (!f->periodic_checker_in_progress && should_rerun) {
+              files_pending_periodic_compaction_check_.emplace_back(level, f);
+            }
+          }
         }
       }
     }

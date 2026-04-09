@@ -23,6 +23,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/merge_operator.h"
+#include "rocksdb/periodic_compaction_checker.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/sst_file_manager.h"
@@ -160,6 +161,10 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(
       log, "       Options.compaction_filter_factory: %s",
       compaction_filter_factory ? compaction_filter_factory->Name() : "None");
+  ROCKS_LOG_HEADER(log, " Options.periodic_compaction_checker_factory: %s",
+                   periodic_compaction_checker_factory
+                       ? periodic_compaction_checker_factory->Name()
+                       : "None");
   ROCKS_LOG_HEADER(
       log, " Options.sst_partitioner_factory: %s",
       sst_partitioner_factory ? sst_partitioner_factory->Name() : "None");

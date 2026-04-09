@@ -274,10 +274,14 @@ struct FileMetaData {
   bool being_compacted = false;       // Is this file undergoing compaction?
   bool init_stats_from_file = false;  // true if the data-entry stats of this
                                       // file has initialized from file.
+  // Runtime-only state for periodic compaction checker scheduling.
+  bool periodic_checker_passed = false;
+  bool periodic_checker_in_progress = false;
 
   bool marked_for_compaction = false;  // True if client asked us nicely to
                                        // compact this file.
   Temperature temperature = Temperature::kUnknown;
+  uint64_t last_periodic_checker_time = 0;
 
   // Used only in BlobDB. The file number of the oldest blob file this SST file
   // refers to. 0 is an invalid value; BlobDB numbers the files starting from 1.

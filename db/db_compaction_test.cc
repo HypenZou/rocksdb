@@ -22,6 +22,7 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/iostats_context.h"
+#include "rocksdb/periodic_compaction_checker.h"
 #include "rocksdb/sst_file_writer.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
@@ -5855,6 +5856,368 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithCompactionFilters) {
 
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   }
+}
+
+class PeriodicCompactionTestCollector : public TablePropertiesCollector {
+ public:
+  Status AddUserKey(const Slice& key, const Slice& /*value*/,
+                    EntryType /*type*/, SequenceNumber /*seq*/,
+                    uint64_t /*file_size*/) override {
+    if (key.starts_with("stale")) {
+      has_stale_ = true;
+    }
+    return Status::OK();
+  }
+
+  Status Finish(UserCollectedProperties* properties) override {
+    (*properties)["rocksdb.test.has_stale"] = has_stale_ ? "1" : "0";
+    return Status::OK();
+  }
+
+  UserCollectedProperties GetReadableProperties() const override {
+    return {{"rocksdb.test.has_stale", has_stale_ ? "1" : "0"}};
+  }
+
+  const char* Name() const override { return "PeriodicCompactionTestCollector"; }
+
+ private:
+  bool has_stale_ = false;
+};
+
+class PeriodicCompactionTestCollectorFactory
+    : public TablePropertiesCollectorFactory {
+ public:
+  TablePropertiesCollector* CreateTablePropertiesCollector(
+      TablePropertiesCollectorFactory::Context /*context*/) override {
+    return new PeriodicCompactionTestCollector();
+  }
+
+  const char* Name() const override {
+    return "PeriodicCompactionTestCollectorFactory";
+  }
+};
+
+class SelectivePeriodicCompactionChecker : public PeriodicCompactionChecker {
+ public:
+  SelectivePeriodicCompactionChecker(
+      const std::shared_ptr<std::atomic<int>>& checker_calls,
+      const std::shared_ptr<std::atomic<bool>>& compact_stale,
+      const std::shared_ptr<std::atomic<bool>>& compact_fresh)
+      : checker_calls_(checker_calls),
+        compact_stale_(compact_stale),
+        compact_fresh_(compact_fresh) {}
+
+  bool ShouldCompact(const Context& /*context*/,
+                     const TableProperties& table_props) const override {
+    ++(*checker_calls_);
+    auto it = table_props.user_collected_properties.find(
+        "rocksdb.test.has_stale");
+    const bool has_stale =
+        it != table_props.user_collected_properties.end() && it->second == "1";
+    return has_stale ? compact_stale_->load() : compact_fresh_->load();
+  }
+
+  const char* Name() const override {
+    return "SelectivePeriodicCompactionChecker";
+  }
+
+ private:
+  std::shared_ptr<std::atomic<int>> checker_calls_;
+  std::shared_ptr<std::atomic<bool>> compact_stale_;
+  std::shared_ptr<std::atomic<bool>> compact_fresh_;
+};
+
+class SelectivePeriodicCompactionCheckerFactory
+    : public PeriodicCompactionCheckerFactory {
+ public:
+  SelectivePeriodicCompactionCheckerFactory(
+      const std::shared_ptr<std::atomic<int>>& checker_calls,
+      const std::shared_ptr<std::atomic<bool>>& compact_stale,
+      const std::shared_ptr<std::atomic<bool>>& compact_fresh)
+      : checker_calls_(checker_calls),
+        compact_stale_(compact_stale),
+        compact_fresh_(compact_fresh) {}
+
+  std::unique_ptr<PeriodicCompactionChecker>
+  CreatePeriodicCompactionChecker() override {
+    return std::unique_ptr<PeriodicCompactionChecker>(
+        new SelectivePeriodicCompactionChecker(checker_calls_, compact_stale_,
+                                               compact_fresh_));
+  }
+
+  const char* Name() const override {
+    return "SelectivePeriodicCompactionCheckerFactory";
+  }
+
+ private:
+  std::shared_ptr<std::atomic<int>> checker_calls_;
+  std::shared_ptr<std::atomic<bool>> compact_stale_;
+  std::shared_ptr<std::atomic<bool>> compact_fresh_;
+};
+
+TEST_F(DBCompactionTest, LevelPeriodicCompactionChecker) {
+  env_->SetMockSleep();
+
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.periodic_compaction_seconds = 24 * 60 * 60;
+  auto checker_calls = std::make_shared<std::atomic<int>>(0);
+  auto compact_stale = std::make_shared<std::atomic<bool>>(true);
+  auto compact_fresh = std::make_shared<std::atomic<bool>>(false);
+  options.table_properties_collector_factories.emplace_back(
+      std::make_shared<PeriodicCompactionTestCollectorFactory>());
+  options.periodic_compaction_checker_factory =
+      std::make_shared<SelectivePeriodicCompactionCheckerFactory>(
+          checker_calls, compact_stale, compact_fresh);
+
+  DestroyAndReopen(options);
+
+  int periodic_compactions = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        auto* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() ==
+            CompactionReason::kPeriodicCompaction) {
+          ++periodic_compactions;
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("stale-a", "1"));
+  ASSERT_OK(Put("stale-b", "1"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("fresh-a", "1"));
+  ASSERT_OK(Put("fresh-b", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(0, periodic_compactions);
+  ASSERT_EQ(0, checker_calls->load());
+
+  env_->MockSleepForSeconds(2 * 24 * 60 * 60);
+  ASSERT_OK(Put("trigger-1", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(1, periodic_compactions);
+  ASSERT_EQ(2, checker_calls->load());
+
+  env_->MockSleepForSeconds(12 * 60 * 60);
+  ASSERT_OK(Put("trigger-2", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(1, periodic_compactions);
+  ASSERT_EQ(2, checker_calls->load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, LevelPeriodicCompactionCheckerRerunsAfterInterval) {
+  env_->SetMockSleep();
+
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.periodic_compaction_seconds = 24 * 60 * 60;
+  auto checker_calls = std::make_shared<std::atomic<int>>(0);
+  auto compact_stale = std::make_shared<std::atomic<bool>>(false);
+  auto compact_fresh = std::make_shared<std::atomic<bool>>(false);
+  options.table_properties_collector_factories.emplace_back(
+      std::make_shared<PeriodicCompactionTestCollectorFactory>());
+  options.periodic_compaction_checker_factory =
+      std::make_shared<SelectivePeriodicCompactionCheckerFactory>(
+          checker_calls, compact_stale, compact_fresh);
+
+  DestroyAndReopen(options);
+
+  int periodic_compactions = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        auto* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() ==
+            CompactionReason::kPeriodicCompaction) {
+          ++periodic_compactions;
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("stale-a", "1"));
+  ASSERT_OK(Put("stale-b", "1"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("fresh-a", "1"));
+  ASSERT_OK(Put("fresh-b", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  env_->MockSleepForSeconds(2 * 24 * 60 * 60);
+  ASSERT_OK(Put("trigger-1", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(0, periodic_compactions);
+  ASSERT_EQ(2, checker_calls->load());
+
+  env_->MockSleepForSeconds(12 * 60 * 60);
+  ASSERT_OK(Put("trigger-2", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(0, periodic_compactions);
+  ASSERT_EQ(2, checker_calls->load());
+
+  compact_stale->store(true);
+  env_->MockSleepForSeconds(12 * 60 * 60);
+  ASSERT_OK(Put("trigger-3", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(1, periodic_compactions);
+  ASSERT_EQ(4, checker_calls->load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, FIFOPeriodicCompactionCheckerIgnored) {
+  env_->SetMockSleep();
+
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.periodic_compaction_seconds = 24 * 60 * 60;
+  options.compaction_options_fifo.max_table_files_size = 1ull << 60;
+  auto checker_calls = std::make_shared<std::atomic<int>>(0);
+  auto compact_stale = std::make_shared<std::atomic<bool>>(true);
+  auto compact_fresh = std::make_shared<std::atomic<bool>>(false);
+  options.table_properties_collector_factories.emplace_back(
+      std::make_shared<PeriodicCompactionTestCollectorFactory>());
+  options.periodic_compaction_checker_factory =
+      std::make_shared<SelectivePeriodicCompactionCheckerFactory>(
+          checker_calls, compact_stale, compact_fresh);
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("stale-a", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("fresh-a", "1"));
+  ASSERT_OK(Flush());
+
+  env_->MockSleepForSeconds(2 * 24 * 60 * 60);
+  ASSERT_OK(Put("trigger-1", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(0, checker_calls->load());
+  ASSERT_EQ("3", FilesPerLevel());
+}
+
+TEST_F(DBCompactionTest, LevelPeriodicCompactionCheckerSetOptions) {
+  env_->SetMockSleep();
+
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.periodic_compaction_seconds = 48 * 60 * 60;
+  auto checker_calls = std::make_shared<std::atomic<int>>(0);
+  auto compact_stale = std::make_shared<std::atomic<bool>>(true);
+  auto compact_fresh = std::make_shared<std::atomic<bool>>(false);
+  options.table_properties_collector_factories.emplace_back(
+      std::make_shared<PeriodicCompactionTestCollectorFactory>());
+  options.periodic_compaction_checker_factory =
+      std::make_shared<SelectivePeriodicCompactionCheckerFactory>(
+          checker_calls, compact_stale, compact_fresh);
+
+  DestroyAndReopen(options);
+
+  int periodic_compactions = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        auto* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() ==
+            CompactionReason::kPeriodicCompaction) {
+          ++periodic_compactions;
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("stale-a", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  env_->MockSleepForSeconds(36 * 60 * 60);
+  ASSERT_OK(Put("trigger-1", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(0, periodic_compactions);
+  ASSERT_EQ(0, checker_calls->load());
+
+  ASSERT_OK(
+      dbfull()->SetOptions({{"periodic_compaction_seconds", "86400"}}));
+  ASSERT_OK(Put("trigger-2", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(1, periodic_compactions);
+  ASSERT_EQ(1, checker_calls->load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, LevelPeriodicCompactionCheckerMultiCF) {
+  class PerCfPeriodicCompactionListener : public EventListener {
+   public:
+    void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+      if (ci.compaction_reason != CompactionReason::kPeriodicCompaction) {
+        return;
+      }
+      if (ci.cf_name == kDefaultColumnFamilyName) {
+        ++default_periodic_compactions;
+      } else if (ci.cf_name == "archive") {
+        ++archive_periodic_compactions;
+      }
+    }
+
+    std::atomic<int> default_periodic_compactions{0};
+    std::atomic<int> archive_periodic_compactions{0};
+  };
+
+  env_->SetMockSleep();
+
+  auto listener = std::make_shared<PerCfPeriodicCompactionListener>();
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.periodic_compaction_seconds = 24 * 60 * 60;
+  auto checker_calls = std::make_shared<std::atomic<int>>(0);
+  auto compact_stale = std::make_shared<std::atomic<bool>>(true);
+  auto compact_fresh = std::make_shared<std::atomic<bool>>(false);
+  options.listeners.emplace_back(listener);
+  options.table_properties_collector_factories.emplace_back(
+      std::make_shared<PeriodicCompactionTestCollectorFactory>());
+  options.periodic_compaction_checker_factory =
+      std::make_shared<SelectivePeriodicCompactionCheckerFactory>(
+          checker_calls, compact_stale, compact_fresh);
+
+  CreateAndReopenWithCF({"archive"}, options);
+
+  ASSERT_OK(Put(0, "stale-default", "1"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Put(1, "fresh-archive", "1"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  env_->MockSleepForSeconds(2 * 24 * 60 * 60);
+  ASSERT_OK(Put(0, "default-trigger", "1"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Put(1, "archive-trigger", "1"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(2, checker_calls->load());
+  ASSERT_EQ(1, listener->default_periodic_compactions.load());
+  ASSERT_EQ(0, listener->archive_periodic_compactions.load());
 }
 
 TEST_F(DBCompactionTest, CompactRangeDelayedByL0FileCount) {

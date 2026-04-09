@@ -26,6 +26,7 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/periodic_compaction_checker.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
@@ -912,6 +913,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          OptionTypeInfo::AsCustomSharedPtr<CompactionFilterFactory>(
              offsetof(struct ImmutableCFOptions, compaction_filter_factory),
              OptionVerificationType::kByName, OptionTypeFlags::kAllowNull)},
+        {"periodic_compaction_checker_factory",
+         OptionTypeInfo::AsCustomSharedPtr<PeriodicCompactionCheckerFactory>(
+             offsetof(struct ImmutableCFOptions,
+                      periodic_compaction_checker_factory),
+             OptionVerificationType::kByName, OptionTypeFlags::kAllowNull)},
         {"merge_operator",
          OptionTypeInfo::AsCustomSharedPtr<MergeOperator>(
              offsetof(struct ImmutableCFOptions, merge_operator),
@@ -1080,6 +1086,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       merge_operator(cf_options.merge_operator),
       compaction_filter(cf_options.compaction_filter),
       compaction_filter_factory(cf_options.compaction_filter_factory),
+      periodic_compaction_checker_factory(
+          cf_options.periodic_compaction_checker_factory),
       min_write_buffer_number_to_merge(
           cf_options.min_write_buffer_number_to_merge),
       max_write_buffer_size_to_maintain(

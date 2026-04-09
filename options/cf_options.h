@@ -38,6 +38,9 @@ struct ImmutableCFOptions {
 
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory;
 
+  std::shared_ptr<PeriodicCompactionCheckerFactory>
+      periodic_compaction_checker_factory;
+
   int min_write_buffer_number_to_merge;
 
   int64_t max_write_buffer_size_to_maintain;

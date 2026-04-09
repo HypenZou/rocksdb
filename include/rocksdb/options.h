@@ -51,6 +51,7 @@ class Logger;
 class MergeOperator;
 class Snapshot;
 class MemTableRepFactory;
+class PeriodicCompactionCheckerFactory;
 class RateLimiter;
 class Slice;
 class Statistics;
@@ -167,6 +168,19 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   //
   // Default: nullptr
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
+
+  // Optional file-level callback used to further refine periodic compaction
+  // eligibility after `periodic_compaction_seconds` has already determined a
+  // file is old enough. Rejected files become eligible to be checked again
+  // after another `periodic_compaction_seconds` interval elapses.
+  //
+  // The callback is invoked in a background compaction thread and outside the
+  // DB mutex. When this option is nullptr, periodic compaction uses the
+  // existing age-only behavior.
+  //
+  // Default: nullptr
+  std::shared_ptr<PeriodicCompactionCheckerFactory>
+      periodic_compaction_checker_factory = nullptr;
 
   // -------------------
   // Parameters that affect performance
